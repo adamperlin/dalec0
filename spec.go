@@ -200,6 +200,7 @@ type SourceContext struct {
 	// Name is the name of the build context. By default, it is the magic name
 	// `context`, recognized by Docker as the default context.
 	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	Path string `yaml:"path,omitempty" json:"path,omitempty"`
 }
 
 // SourceBuild is used to generate source from a DockerFile build, either

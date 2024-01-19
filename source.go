@@ -18,7 +18,7 @@ type AsLLBState interface {
 	IsDir() bool
 }
 
-func mapGetter(getter LLBGetter, f func(llb.State) llb.State) LLBGetter {
+func mapGetter(getter LLBGetter, f StateFunc) LLBGetter {
 	return func(sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
 		st, err := getter(sOpt, opts...)
 		if err != nil {
@@ -29,51 +29,108 @@ func mapGetter(getter LLBGetter, f func(llb.State) llb.State) LLBGetter {
 	}
 }
 
+func defaultTargetPath(path string, forMount bool) string {
+	if !forMount && path != "" {
+		return path
+	}
+
+	return "/"
+}
+
+// given a source, returns the target path in the generated LLB
+// that should be returned
+func (src Source) TargetPath(forMount bool) (string, error) {
+	switch {
+	case src.HTTPS != nil,
+		src.Build != nil,
+		src.Git != nil:
+		return defaultTargetPath(src.Path, forMount), nil
+	case src.Context != nil:
+		path := src.Path
+		if path != src.Context.Path && src.Context.Path != "" {
+			// use nested context path if root source path is empty
+			path = src.Context.Path
+		}
+		return defaultTargetPath(path, forMount), nil
+	case src.DockerImage != nil:
+		// path already handled for docker images
+		return "/", nil
+	}
+
+	return "", fmt.Errorf("no variant defined")
+}
+
+// a StateFunc is any transformation which maps
+// llb state -> llb state
+type StateFunc func(llb.State) llb.State
+
 func GetSource(src Source, name string, forMount bool, opts ...llb.ConstraintsOpt) (LLBGetter, bool, error) {
-	// validate all the things
 	if err := src.validate(); err != nil {
 		return nil, false, err
 	}
 
-	filterClosure := func(st llb.State) llb.State {
-		return filterState(st, src.Path, src.Includes, src.Excludes, opts...)
+	filterWith := func(fopts filterOpts) StateFunc {
+		return func(st llb.State) llb.State {
+			return filterState(st, fopts, opts...)
+		}
+	}
+
+	targetPath, err := src.TargetPath(forMount)
+	if err != nil {
+		return nil, false, err
 	}
 
 	// load the source
 	switch {
 	case src.HTTPS != nil:
 		llbGetter := src.HTTPS.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
-		if src.Path != "" && !forMount || len(src.Includes) > 0 || len(src.Excludes) > 0 {
-			llbGetter = mapGetter(llbGetter, filterClosure)
-		}
-
+		llbGetter = mapGetter(llbGetter, filterWith(filterOpts{
+			srcPath:  targetPath,
+			includes: src.Includes,
+			excludes: src.Excludes,
+		}))
 		return llbGetter, src.HTTPS.IsDir(), nil
 	case src.Git != nil:
 		llbGetter := src.Git.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
-		if src.Path != "" && !forMount || len(src.Includes) > 0 || len(src.Excludes) > 0 {
-			llbGetter = mapGetter(llbGetter, filterClosure)
-		}
+		llbGetter = mapGetter(llbGetter, filterWith(filterOpts{
+			srcPath:  targetPath,
+			includes: src.Includes,
+			excludes: src.Excludes,
+		}))
 
 		return llbGetter, src.Git.IsDir(), nil
 	case src.Context != nil:
 		llbGetter := src.Context.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
-		if src.Path != "" && !forMount {
-			llbGetter = mapGetter(llbGetter, filterClosure)
-		}
+		llbGetter = mapGetter(llbGetter, filterWith(filterOpts{
+			srcPath: targetPath,
+			// no includes or excludes are part of the filter options
+			// for SourceContext since context sources already handle
+			// includes and excludes
+			includes: []string{},
+			excludes: []string{},
+		}))
 
 		return llbGetter, src.Context.IsDir(), nil
 	case src.DockerImage != nil:
+		// include-exclude-handled = false
 		llbGetter := src.DockerImage.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
+		// clarify this case:
 		if src.DockerImage.Cmd == nil {
-			llbGetter = mapGetter(llbGetter, filterClosure)
+			llbGetter = mapGetter(llbGetter, filterWith(filterOpts{
+				srcPath:  targetPath,
+				includes: src.Includes,
+				excludes: src.Excludes,
+			}))
 		}
 
 		return llbGetter, src.DockerImage.IsDir(), nil
 	case src.Build != nil:
 		llbGetter := src.Build.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
-		if src.Path != "" && !forMount || len(src.Includes) > 0 || len(src.Excludes) > 0 {
-			llbGetter = mapGetter(llbGetter, filterClosure)
-		}
+		llbGetter = mapGetter(llbGetter, filterWith(filterOpts{
+			srcPath:  targetPath,
+			includes: src.Includes,
+			excludes: src.Excludes,
+		}))
 
 		return llbGetter, src.Build.IsDir(), nil
 	}
@@ -109,7 +166,7 @@ func (src *SourceGit) AsState(name string, path string, forMount bool, includes,
 			gOpts = append(gOpts, llb.KeepGitDir())
 		}
 		gOpts = append(gOpts, withConstraints(opts))
-		return llb.Git(ref.Remote, ref.Commit, gOpts...), nil
+		return llb.Git(ref.Remote, src.Commit, gOpts...), nil
 	}
 }
 
@@ -236,75 +293,32 @@ func Source2LLBGetter(_ *Spec, src Source, name string) LLBGetter {
 	return source2LLBGetter(src, name, false)
 }
 
-func needsFilter(o *filterOpts) bool {
-	if o.source.Path != "" && !o.forMount && !o.pathHandled {
-		return true
-	}
-	if o.includeExcludeHandled {
-		return false
-	}
-	if len(o.source.Includes) > 0 || len(o.source.Excludes) > 0 {
-		return true
-	}
-	return false
-}
-
 type filterOpts struct {
-	state                 llb.State
-	source                Source
-	opts                  []llb.ConstraintsOpt
-	forMount              bool
-	includeExcludeHandled bool
-	pathHandled           bool
-	err                   error
+	srcPath  string
+	includes []string
+	excludes []string
 }
 
-func filterState(st llb.State, srcPath string, includes, excludes []string, opts ...llb.ConstraintsOpt) llb.State {
-	if srcPath == "" {
-		srcPath = "/"
+func filterState(st llb.State, fopts filterOpts, opts ...llb.ConstraintsOpt) llb.State {
+	// if we have no includes and no excludes, and no non-root source path,
+	// then this is a no-op
+	if len(fopts.includes) == 0 && len(fopts.excludes) == 0 && fopts.srcPath == "/" {
+		return st
 	}
+
 	filtered := llb.Scratch().File(
 		llb.Copy(
 			st,
-			srcPath,
+			fopts.srcPath,
 			"/",
-			WithIncludes(includes),
-			WithExcludes(excludes),
+			WithIncludes(fopts.includes),
+			WithExcludes(fopts.excludes),
 			WithDirContentsOnly(),
 		),
 		withConstraints(opts),
 	)
 
 	return filtered
-}
-
-func handleFilter(o *filterOpts) (llb.State, error) {
-	if o.err != nil {
-		return o.state, o.err
-	}
-
-	if !needsFilter(o) {
-		return o.state, nil
-	}
-
-	srcPath := "/"
-	if !o.pathHandled {
-		srcPath = o.source.Path
-	}
-
-	filtered := llb.Scratch().File(
-		llb.Copy(
-			o.state,
-			srcPath,
-			"/",
-			WithIncludes(o.source.Includes),
-			WithExcludes(o.source.Excludes),
-			WithDirContentsOnly(),
-		),
-		withConstraints(o.opts),
-	)
-
-	return filtered, nil
 }
 
 func source2LLBGetter(src Source, name string, forMount bool) LLBGetter {
