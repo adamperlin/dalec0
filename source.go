@@ -53,7 +53,8 @@ func (src Source) TargetPath(forMount bool) (string, error) {
 		}
 		return defaultTargetPath(path, forMount), nil
 	case src.DockerImage != nil:
-		// path already handled for docker images
+		// path already handled for docker images in AsState(), so at this point
+		// we can extract LLB from root
 		return "/", nil
 	}
 
