@@ -41,17 +41,11 @@ func defaultTargetPath(path string, forMount bool) string {
 // that should be returned
 func (src Source) TargetPath(forMount bool) (string, error) {
 	switch {
-	case src.HTTPS != nil,
+	case src.HTTP != nil,
 		src.Build != nil,
-		src.Git != nil:
+		src.Git != nil,
+		src.Context != nil:
 		return defaultTargetPath(src.Path, forMount), nil
-	case src.Context != nil:
-		path := src.Path
-		if path != src.Context.Path && src.Context.Path != "" {
-			// use nested context path if root source path is empty
-			path = src.Context.Path
-		}
-		return defaultTargetPath(path, forMount), nil
 	case src.DockerImage != nil:
 		// path already handled for docker images in AsState(), so at this point
 		// we can extract LLB from root
@@ -83,14 +77,14 @@ func GetSource(src Source, name string, forMount bool, opts ...llb.ConstraintsOp
 
 	// load the source
 	switch {
-	case src.HTTPS != nil:
-		llbGetter := src.HTTPS.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
+	case src.HTTP != nil:
+		llbGetter := src.HTTP.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
 		llbGetter = mapGetter(llbGetter, filterWith(filterOpts{
 			srcPath:  targetPath,
 			includes: src.Includes,
 			excludes: src.Excludes,
 		}))
-		return llbGetter, src.HTTPS.IsDir(), nil
+		return llbGetter, src.HTTP.IsDir(), nil
 	case src.Git != nil:
 		llbGetter := src.Git.AsState(name, src.Path, forMount, src.Includes, src.Excludes)
 		llbGetter = mapGetter(llbGetter, filterWith(filterOpts{
@@ -183,14 +177,11 @@ func (src *SourceDockerImage) AsState(name string, path string, forMount bool, i
 			return st, nil
 		}
 
-		eSt, err := generateSourceFromImage(name, st, src.Cmd, sOpt, opts...)
+		st, err := generateSourceFromImage(name, st, src.Cmd, sOpt, path, opts...)
 		if err != nil {
 			return llb.Scratch(), err
 		}
-		if path != "" {
-			return eSt.AddMount(path, llb.Scratch()), nil
-		}
-		return eSt.Root(), nil
+		return st, nil
 	}
 }
 
@@ -218,7 +209,7 @@ func (src *SourceBuild) IsDir() bool {
 	return true
 }
 
-func (src *SourceHTTPS) AsState(name string, path string, forMount bool, includes, excludes []string) LLBGetter {
+func (src *SourceHTTP) AsState(name string, path string, forMount bool, includes, excludes []string) LLBGetter {
 	return func(sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
 		httpOpts := []llb.HTTPOption{withConstraints(opts)}
 		httpOpts = append(httpOpts, llb.Filename(name))
@@ -226,7 +217,7 @@ func (src *SourceHTTPS) AsState(name string, path string, forMount bool, include
 	}
 }
 
-func (src *SourceHTTPS) IsDir() bool {
+func (src *SourceHTTP) IsDir() bool {
 	return false
 }
 
@@ -245,11 +236,11 @@ func shArgs(cmd string) llb.RunOption {
 }
 
 // must not be called with a nil cmd pointer
-func generateSourceFromImage(name string, st llb.State, cmd *Command, sOpts SourceOpts, opts ...llb.ConstraintsOpt) (llb.ExecState, error) {
-	var zero llb.ExecState
+func generateSourceFromImage(name string, st llb.State, cmd *Command, sOpts SourceOpts, subPath string, opts ...llb.ConstraintsOpt) (llb.State, error) {
 	if len(cmd.Steps) == 0 {
-		return zero, fmt.Errorf("no steps defined for image source")
+		return llb.Scratch(), fmt.Errorf("no steps defined for image source")
 	}
+
 	for k, v := range cmd.Env {
 		st = st.AddEnv(k, v)
 	}
@@ -262,7 +253,7 @@ func generateSourceFromImage(name string, st llb.State, cmd *Command, sOpts Sour
 	for _, src := range cmd.Mounts {
 		srcSt, err := source2LLBGetter(src.Spec, name, true)(sOpts, opts...)
 		if err != nil {
-			return zero, err
+			return llb.Scratch(), err
 		}
 		var mountOpt []llb.MountOption
 		if src.Spec.Path != "" && len(src.Spec.Includes) == 0 && len(src.Spec.Excludes) == 0 {
@@ -271,7 +262,7 @@ func generateSourceFromImage(name string, st llb.State, cmd *Command, sOpts Sour
 		baseRunOpts = append(baseRunOpts, llb.AddMount(src.Dest, srcSt, mountOpt...))
 	}
 
-	var cmdSt llb.ExecState
+	out := llb.Scratch()
 	for _, step := range cmd.Steps {
 		rOpts := []llb.RunOption{llb.Args([]string{
 			"/bin/sh", "-c", step.Command,
@@ -284,10 +275,11 @@ func generateSourceFromImage(name string, st llb.State, cmd *Command, sOpts Sour
 		}
 
 		rOpts = append(rOpts, withConstraints(opts))
-		cmdSt = st.Run(rOpts...)
+		cmdSt := st.Run(rOpts...)
+		out = cmdSt.AddMount(subPath, out)
 	}
 
-	return cmdSt, nil
+	return out, nil
 }
 
 func Source2LLBGetter(_ *Spec, src Source, name string) LLBGetter {
@@ -359,7 +351,7 @@ func SourceIsDir(src Source) (bool, error) {
 		src.Build != nil,
 		src.Context != nil:
 		return true, nil
-	case src.HTTPS != nil:
+	case src.HTTP != nil:
 		return false, nil
 	default:
 		return false, fmt.Errorf("unsupported source type")
@@ -416,9 +408,9 @@ func (s Source) Doc() (io.Reader, error) {
 			}
 			fmt.Fprintln(b, "	Dockerfile path in context:", p)
 		}
-	case s.HTTPS != nil:
+	case s.HTTP != nil:
 		fmt.Fprintln(b, "Generated from a http(s) source:")
-		fmt.Fprintln(b, "	URL:", s.HTTPS.URL)
+		fmt.Fprintln(b, "	URL:", s.HTTP.URL)
 	case s.Git != nil:
 		git := s.Git
 		ref, err := gitutil.ParseGitRef(git.URL)
@@ -426,7 +418,8 @@ func (s Source) Doc() (io.Reader, error) {
 			return nil, err
 		}
 		fmt.Fprintln(b, "Generated from a git repository:")
-		fmt.Fprintln(b, "	Ref:", ref.Commit)
+		fmt.Fprintln(b, "	Remote:", ref.Remote)
+		fmt.Fprintln(b, "	Ref:", git.Commit)
 		if s.Path != "" {
 			fmt.Fprintln(b, "	Extraced path:", s.Path)
 		}

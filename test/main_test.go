@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/Azure/dalec/test/fixtures"
+	"github.com/Azure/dalec/test/testenv"
 	"github.com/moby/buildkit/util/tracing/detect"
 	_ "github.com/moby/buildkit/util/tracing/detect/delegated"
 	"go.opentelemetry.io/otel"
@@ -18,6 +19,7 @@ import (
 
 var (
 	baseCtx = context.Background()
+	testEnv *testenv.BuildxEnv
 )
 
 func TestMain(m *testing.M) {
@@ -46,37 +48,23 @@ func TestMain(m *testing.M) {
 	}
 	otel.SetTracerProvider(tp)
 
-	ctx, cancel := signal.NotifyContext(baseCtx, os.Interrupt)
-	defer cancel()
-	baseCtx = ctx
-
-	baseClient, err = defaultBuildkitClient(ctx)
-	if err != nil {
-		panic(err)
-	}
+	testEnv = testenv.New()
 
 	run := func() int {
-		releaseReg := func(context.Context) error { return nil }
-		pushFrontend = sync.OnceValues(func() (string, error) {
-			var (
-				err error
-				s   string
-			)
-			s, releaseReg, err = _pushFrontendToRegistry(ctx, baseClient)
-			return s, err
-		})
+		ctx, _ := signal.NotifyContext(baseCtx, os.Interrupt)
+		baseCtx = ctx
 
-		supportsFrontendNamedContexts = sync.OnceValue(func() bool {
-			return _supportsFrontendNamedContexts(ctx, baseClient)
-		})
 		defer func() {
-			if err := releaseReg(context.WithoutCancel(ctx)); err != nil {
-				fmt.Fprintln(os.Stderr, "Error releasing registry:", err)
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			if err := detect.Shutdown(ctx); err != nil {
+				fmt.Fprintln(os.Stderr, "error shutting down tracer:", err)
 			}
-			ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			_ = detect.Shutdown(ctx)
 			cancel()
 		}()
+
+		if err := testEnv.Load(ctx, phonyRef, fixtures.PhonyFrontend); err != nil {
+			panic(err)
+		}
 
 		return m.Run()
 	}

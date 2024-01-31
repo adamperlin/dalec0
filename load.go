@@ -4,6 +4,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/goccy/go-yaml"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
@@ -24,60 +25,61 @@ func knownArg(key string) bool {
 
 const DefaultPatchStrip int = 1
 
-func (s *Source) processArgs(args map[string]string) error {
+func (s *Source) substituteBuildArgs(args map[string]string) error {
 	lex := shell.NewLex('\\')
-
-	sub := func(s *string) error {
-		updated, err := lex.ProcessWordWithMap(*s, args)
-		if err != nil {
-			return err
-		}
-		*s = updated
-		return nil
-	}
 
 	switch {
 	case s.DockerImage != nil:
 		for _, mnt := range s.DockerImage.Cmd.Mounts {
-			if err := mnt.Spec.processArgs(args); err != nil {
+			if err := mnt.Spec.substituteBuildArgs(args); err != nil {
 				return err
 			}
 		}
-		if err := sub(&s.DockerImage.Ref); err != nil {
+		updated, err := lex.ProcessWordWithMap(s.DockerImage.Ref, args)
+		if err != nil {
 			return err
 		}
+		s.DockerImage.Ref = updated
 	case s.Git != nil:
-		fields := []*string{
-			&s.Git.URL,
-			&s.Git.Commit,
-		}
-		for _, f := range fields {
-			if err := sub(f); err != nil {
-				return err
-			}
-		}
-	case s.HTTPS != nil:
-		if err := sub(&s.HTTPS.URL); err != nil {
+		updated, err := lex.ProcessWordWithMap(s.Git.URL, args)
+		if err != nil {
 			return err
 		}
+		s.Git.URL = updated
+
+		updated, err = lex.ProcessWordWithMap(s.Git.Commit, args)
+		if err != nil {
+			return err
+		}
+		s.Git.Commit = updated
+	case s.HTTP != nil:
+		updated, err := lex.ProcessWordWithMap(s.HTTP.URL, args)
+		if err != nil {
+			return err
+		}
+		s.HTTP.URL = updated
 	case s.Context != nil:
-		if err := sub(&s.Context.Name); err != nil {
+		updated, err := lex.ProcessWordWithMap(s.Context.Name, args)
+		if err != nil {
 			return err
 		}
+		s.Context.Name = updated
 	case s.Build != nil:
-		if err := s.Build.Source.processArgs(args); err != nil {
+		if err := s.Build.Source.substituteBuildArgs(args); err != nil {
 			return err
 		}
 
-		fields := []*string{
-			&s.Build.DockerFile,
-			&s.Build.Target,
+		updated, err := lex.ProcessWordWithMap(s.Build.DockerFile, args)
+		if err != nil {
+			return err
 		}
-		for _, f := range fields {
-			if err := sub(f); err != nil {
-				return err
-			}
+		s.Build.DockerFile = updated
+
+		updated, err = lex.ProcessWordWithMap(s.Build.Target, args)
+		if err != nil {
+			return err
 		}
+		s.Build.Target = updated
 	}
 
 	return nil
@@ -90,52 +92,68 @@ func fillDefaults(s *Source) {
 			fillDefaults(&mnt.Spec)
 		}
 	case s.Git != nil:
-	case s.HTTPS != nil:
+	case s.HTTP != nil:
 	case s.Context != nil:
+		origContextName := s.Context.Name
 		if s.Context.Name == "" {
 			s.Context.Name = dockerui.DefaultLocalNameContext
 		}
-		if s.Path == "" {
-			s.Path = "."
+
+		ctxPath := origContextName
+		if ctxPath == "" || ctxPath == dockerui.DefaultLocalNameContext {
+			ctxPath = "."
 		}
+		s.Path = ctxPath
 	case s.Build != nil:
 		fillDefaults(&s.Build.Source)
 	}
 }
 
-func (s *Source) validate() error {
+func (s *Source) validate(failContext ...string) (retErr error) {
 	count := 0
-	var errs error
+
+	defer func() {
+		if retErr != nil && failContext != nil {
+			retErr = errors.Wrap(retErr, strings.Join(failContext, " "))
+		}
+	}()
 
 	if s.DockerImage != nil {
-		for _, mnt := range s.DockerImage.Cmd.Mounts {
-			if err := mnt.Spec.validate(); err != nil {
-				errs = goerrors.Join(errs, err)
+		if s.DockerImage.Ref == "" {
+			retErr = goerrors.Join(retErr, fmt.Errorf("docker image source variant must have a ref"))
+		}
+
+		if s.DockerImage.Cmd != nil {
+			for _, mnt := range s.DockerImage.Cmd.Mounts {
+				if err := mnt.Spec.validate("docker image source with ref", "'"+s.DockerImage.Ref+"'"); err != nil {
+					retErr = goerrors.Join(retErr, err)
+				}
 			}
 		}
 
 		count++
 	}
+	if retErr != nil {
+		return retErr
+	}
+
 	if s.Git != nil {
 		count++
 	}
-	if s.HTTPS != nil {
+	if s.HTTP != nil {
 		count++
 	}
 	if s.Context != nil {
 		count++
 	}
 	if s.Build != nil {
-		if s.Build.Source.Build != nil {
-			errs = goerrors.Join(errs, fmt.Errorf("build sources cannot be recursive"))
+		c := s.Build.DockerFile
+		if s.Build.Inline != "" {
+			c = s.Build.Inline
 		}
 
-		if s.Build.DockerFile != "" && s.Build.Inline != "" {
-			errs = goerrors.Join(errs, fmt.Errorf("build sources may use either `dockerfile` or `inline`, but not both"))
-		}
-
-		if err := s.Build.Source.validate(); err != nil {
-			errs = goerrors.Join(errs, err)
+		if err := s.Build.validate("build source with dockerfile", "`"+c+"`"); err != nil {
+			retErr = goerrors.Join(retErr, err)
 		}
 
 		count++
@@ -143,14 +161,40 @@ func (s *Source) validate() error {
 
 	switch count {
 	case 0:
-		errs = goerrors.Join(errs, fmt.Errorf("no non-nil source variant"))
+		retErr = goerrors.Join(retErr, fmt.Errorf("no non-nil source variant"))
 	case 1:
-		// success condition
+		return retErr
 	default:
-		errs = goerrors.Join(errs, fmt.Errorf("more than one source variant defined"))
+		retErr = goerrors.Join(retErr, fmt.Errorf("more than one source variant defined"))
 	}
 
-	return errs
+	return retErr
+}
+
+func (s *SourceBuild) validate(failContext ...string) (retErr error) {
+	defer func() {
+		if retErr != nil && failContext != nil {
+			retErr = errors.Wrap(retErr, strings.Join(failContext, " "))
+		}
+	}()
+
+	if s.Source.Build != nil {
+		return goerrors.Join(retErr, fmt.Errorf("build sources cannot be recursive"))
+	}
+
+	if s.DockerFile != "" && s.Inline != "" {
+		retErr = goerrors.Join(retErr, fmt.Errorf("build sources may use either `dockerfile` or `inline`, but not both"))
+	}
+
+	if s.DockerFile == "" && s.Inline == "" {
+		retErr = goerrors.Join(retErr, fmt.Errorf("build must use either `dockerfile` or `inline`"))
+	}
+
+	if err := s.Source.validate("build subsource"); err != nil {
+		retErr = goerrors.Join(retErr, err)
+	}
+
+	return
 }
 
 // LoadSpec loads a spec from the given data.
@@ -183,7 +227,7 @@ func LoadSpec(dt []byte, env map[string]string) (*Spec, error) {
 
 		fillDefaults(&src)
 
-		if err := src.processArgs(args); err != nil {
+		if err := src.substituteBuildArgs(args); err != nil {
 			return nil, fmt.Errorf("error performing shell expansion on source %q: %w", name, err)
 		}
 		if src.DockerImage != nil {
@@ -266,7 +310,7 @@ func (c *Command) processBuildArgs(lex *shell.Lex, args map[string]string, name 
 		return nil
 	}
 	for _, s := range c.Mounts {
-		if err := s.Spec.processArgs(args); err != nil {
+		if err := s.Spec.substituteBuildArgs(args); err != nil {
 			return fmt.Errorf("error performing shell expansion on source ref %q: %w", name, err)
 		}
 	}
