@@ -13,186 +13,179 @@ import (
 	"github.com/moby/buildkit/util/gitutil"
 )
 
-type AsLLBState interface {
-	// AsState returns an LLB state for the source.
-	// `name` is used to identify the source in the spec
-	// `extract` is used to extract a subpath from the source.
-	// `after` is used to apply an optional filter to the source, or can be used as a general callback to apply additional operations to the source.
-	// `fOpts` is used to apply a filter to the source.
+// type AsLLBState interface {
+// 	// AsState returns an LLB state for the source.
+// 	// `name` is used to identify the source in the spec
+// 	// `extract` is used to extract a subpath from the source.
+// 	// `after` is used to apply an optional filter to the source, or can be used as a general callback to apply additional operations to the source.
+// 	// `fOpts` is used to apply a filter to the source.
 
-	AsState(name string, parent *Source, after FilterFunc, sOpts SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error)
+// 	AsState(name string, parent *Source, after FilterFunc, sOpts SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error)
+// }
+
+type FilterFunc = func(string, []string, []string, ...llb.ConstraintsOpt) ResultStateOption
+
+type ResultState struct {
+	rs Result[llb.State]
 }
 
-var _ AsLLBState = &SourceHTTP{}
-var _ AsLLBState = &SourceGit{}
-var _ AsLLBState = &SourceDockerImage{}
-var _ AsLLBState = &SourceBuild{}
-var _ AsLLBState = &SourceContext{}
+func (r ResultState) State() llb.State {
+	return r.rs.data
+}
 
-func (s Source) DefaultFilterOpts() filterOpts {
-	return filterOpts{
-		srcPath:  s.Path,
-		includes: s.Includes,
-		excludes: s.Excludes,
+func (r ResultState) Err() error {
+	return r.rs.err
+}
+
+type ResultStateOption func(llb.State) (llb.State, error)
+
+func (r ResultState) With(opts ...ResultStateOption) ResultState {
+	if r.rs.IsErr() {
+		return r
+	}
+
+	for _, opt := range opts {
+		st, err := opt(r.rs.data)
+		if err != nil {
+			r.rs.err = err
+		}
+		r.rs.data = st
+	}
+
+	return r
+}
+
+func asResultState(st llb.State) ResultState {
+	return ResultState{
+		rs: FromT(st),
 	}
 }
 
-func (s *Source) FilterOpts() filterOpts {
-	if s.Path == "" {
-		s.Path = "/"
-	}
-
-	switch {
-	case s.Git != nil,
-		s.HTTP != nil,
-		s.Build != nil:
-		return s.DefaultFilterOpts()
-	case s.Context != nil:
-		// includes and excludes are already part of the context,
-		// so set includes and excludes to be empty
-		return filterOpts{
-			srcPath:  s.Path,
-			includes: []string{},
-			excludes: []string{},
-		}
-	case s.DockerImage != nil:
-		// docker image only needs different extract path if it has a cmd
-		var p string = "/"
-		if s.DockerImage.Cmd == nil {
-			p = s.Path
-		}
-		return filterOpts{
-			srcPath:  p,
-			includes: s.Includes,
-			excludes: s.Excludes,
-		}
-	default:
-		panic("unknown source type")
-	}
-}
-
-func GetSource(src Source, name string, after FilterFunc, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
+func GetSource(src Source, name string, filter FilterFunc, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
 	if err := src.validate(); err != nil {
 		return llb.Scratch(), err
 	}
 
-	fOpts := src.FilterOpts()
-
-	var (
-		st          llb.State
-		sourceState *llb.State = nil
-		err         error      = fmt.Errorf("no source variant defined")
-	)
+	base := asResultState(llb.Scratch())
 
 	// load the source
 	switch {
 	case src.HTTP != nil:
-		st, err = src.HTTP.AsState(name, &src, after, sOpt, opts...)
-		sourceState = &st
+		maybeSt := base.With(src.HTTP.AsState(name, opts...)).With(filter(src.Path, src.Includes, src.Excludes, opts...))
+		return maybeSt.State(), maybeSt.Err()
 	case src.Git != nil:
-		st, err = src.Git.AsState(name, &src, after, sOpt, opts...)
-		sourceState = &st
+		maybeSt := base.With(src.Git.AsState(opts...)).With(filter(src.Path, src.Includes, src.Excludes))
+		return maybeSt.State(), maybeSt.Err()
 	case src.Context != nil:
-		st, err = src.Context.AsState(name, &src, after, sOpt, opts...)
-		sourceState = &st
+		rsOpt := src.Context.AsState(&src, sOpt, opts...)
+		maybeSt := base.With(rsOpt).
+			With(filter(src.Path, []string{}, []string{}))
+
+		return maybeSt.State(), maybeSt.Err()
+
 	case src.DockerImage != nil:
-		st, err = src.DockerImage.AsState(name, &src, after, sOpt, opts...)
-		sourceState = &st
+		rsOpt := src.DockerImage.AsState(name, &src, sOpt, opts...)
+
+		rs := base.With(rsOpt)
+		if src.DockerImage.Cmd != nil {
+			maybeSt := rs.With(filter("/", src.Includes, src.Excludes))
+			return maybeSt.State(), maybeSt.Err()
+		}
+
+		maybeSt := rs.With(filter(src.Path, src.Includes, src.Excludes))
+		return maybeSt.State(), maybeSt.Err()
+
 	case src.Build != nil:
-		st, err = src.Build.AsState(name, &src, after, sOpt, opts...)
-		sourceState = &st
+		rsOpt := src.Build.AsState(name, &src, filter, sOpt, opts...)
+
+		maybeSt := base.With(rsOpt).With(filter(src.Path, src.Includes, src.Excludes))
+		return maybeSt.State(), maybeSt.Err()
 	}
 
-	if err != nil {
-		return llb.Scratch(), err
-	}
-
-	// source state should not be nil in this case, but check if it is as a sanity check
-	// before applying filter
-	if sourceState != nil {
-		st = filterState(*sourceState, fOpts, opts...)
-	} else {
-		st = llb.Scratch()
-	}
-
-	return st, err
+	return llb.Scratch(), fmt.Errorf("no variant defined")
 }
 
-func (src *SourceContext) AsState(name string, parent *Source, after FilterFunc, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
-	st, err := sOpt.GetContext(dockerui.DefaultLocalNameContext, localIncludeExcludeMerge(parent.Includes, parent.Excludes), withConstraints(opts))
-	if err != nil {
-		return llb.Scratch(), err
-	}
+func (src *SourceContext) AsState(parent *Source, sOpt SourceOpts, opts ...llb.ConstraintsOpt) ResultStateOption {
+	return func(base llb.State) (llb.State, error) {
+		st, err := sOpt.GetContext(dockerui.DefaultLocalNameContext, localIncludeExcludeMerge(parent.Includes, parent.Excludes), withConstraints(opts))
+		if err != nil {
+			return llb.Scratch(), err
+		}
 
-	return *st, nil
+		return *st, nil
+	}
 }
 
-func (src *SourceGit) AsState(name string, _ *Source, after FilterFunc, _ SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
-	// TODO: Pass git secrets
-	ref, err := gitutil.ParseGitRef(src.URL)
-	if err != nil {
-		return llb.Scratch(), fmt.Errorf("could not parse git ref: %w", err)
-	}
+func (src *SourceGit) AsState(opts ...llb.ConstraintsOpt) ResultStateOption {
+	return func(base llb.State) (llb.State, error) {
+		ref, err := gitutil.ParseGitRef(src.URL)
+		if err != nil {
+			return llb.Scratch(), fmt.Errorf("could not parse git ref: %w", err)
+		}
 
-	var gOpts []llb.GitOption
-	if src.KeepGitDir {
-		gOpts = append(gOpts, llb.KeepGitDir())
-	}
-	gOpts = append(gOpts, withConstraints(opts))
+		var gOpts []llb.GitOption
+		if src.KeepGitDir {
+			gOpts = append(gOpts, llb.KeepGitDir())
+		}
+		gOpts = append(gOpts, withConstraints(opts))
 
-	st := llb.Git(ref.Remote, src.Commit, gOpts...)
-	return st, nil
-}
-
-func (src *SourceDockerImage) AsState(name string, parent *Source, after FilterFunc, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
-	st := llb.Image(src.Ref, llb.WithMetaResolver(sOpt.Resolver), withConstraints(opts))
-
-	if src.Cmd == nil {
+		st := llb.Git(ref.Remote, src.Commit, gOpts...)
 		return st, nil
 	}
+	// TODO: Pass git secrets
+}
 
-	st, err := generateSourceFromImage(name, st, src.Cmd, sOpt, parent.Path, opts...)
-	if err != nil {
-		return llb.Scratch(), err
+func (src *SourceDockerImage) AsState(name string, parent *Source, sOpt SourceOpts, opts ...llb.ConstraintsOpt) ResultStateOption {
+	return func(_ llb.State) (llb.State, error) {
+		st := llb.Image(src.Ref, llb.WithMetaResolver(sOpt.Resolver), withConstraints(opts))
+		if src.Cmd == nil {
+			return st, nil
+		}
+
+		st, err := generateSourceFromImage(name, st, src.Cmd, sOpt, parent.Path, opts...)
+		if err != nil {
+			return llb.Scratch(), err
+		}
+
+		return st, nil
 	}
-
-	return st, nil
 }
 
-type FilterFunc func(llb.State, filterOpts, ...llb.ConstraintsOpt) llb.State
+// return back whether filter is needed, you already know at the call site
+// not all AsState() impls need exactly the same call interface
+// llb.With() for apply StateOption(s)
 
-func ApplyFilterMount(st llb.State, fOpts filterOpts, opts ...llb.ConstraintsOpt) llb.State {
-	// force srcPath to be "/" for a mount,
-	// since we will be mounting the source at the destination path
-	// later
-	fOpts.srcPath = "/"
-	return filterState(st, fOpts, opts...)
+func DefaultSourceFilter(extract string, includes, excludes []string, opts ...llb.ConstraintsOpt) ResultStateOption {
+	return filterState(extract, includes, excludes, opts...)
 }
 
-func ApplyFilter(st llb.State, fOpts filterOpts, opts ...llb.ConstraintsOpt) llb.State {
-	return filterState(st, fOpts, opts...)
+func TargetMountSourceFilter(_ string, includes, excludes []string, opts ...llb.ConstraintsOpt) ResultStateOption {
+	return filterState("/", includes, excludes, opts...)
 }
 
-func (src *SourceBuild) AsState(name string, _ *Source, after FilterFunc, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
-	st, err := GetSource(src.Source, name, after, sOpt, opts...)
-	if err != nil {
-		return llb.Scratch(), err
+func (src *SourceBuild) AsState(name string, _ *Source, filter FilterFunc, sOpt SourceOpts, opts ...llb.ConstraintsOpt) ResultStateOption {
+	return func(_ llb.State) (llb.State, error) {
+		st, err := GetSource(src.Source, name, filter, sOpt, opts...)
+		if err != nil {
+			return llb.Scratch(), err
+		}
+
+		st, err = sOpt.Forward(st, src)
+		if err != nil {
+			return llb.Scratch(), err
+		}
+
+		return st, nil
 	}
-
-	st, err = sOpt.Forward(st, src)
-	if err != nil {
-		return llb.Scratch(), err
-	}
-
-	return st, nil
 }
 
-func (src *SourceHTTP) AsState(name string, _ *Source, after FilterFunc, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
-	httpOpts := []llb.HTTPOption{withConstraints(opts)}
-	httpOpts = append(httpOpts, llb.Filename(name))
-
-	st := llb.HTTP(src.URL, httpOpts...)
-	return st, nil
+func (src *SourceHTTP) AsState(name string, opts ...llb.ConstraintsOpt) ResultStateOption {
+	return func(_ llb.State) (llb.State, error) {
+		httpOpts := []llb.HTTPOption{withConstraints(opts)}
+		httpOpts = append(httpOpts, llb.Filename(name))
+		st := llb.HTTP(src.URL, httpOpts...)
+		return st, nil
+	}
 }
 
 type ForwarderFunc func(llb.State, *SourceBuild) (llb.State, error)
@@ -223,7 +216,7 @@ func generateSourceFromImage(name string, st llb.State, cmd *Command, sOpts Sour
 	baseRunOpts := []llb.RunOption{CacheDirsToRunOpt(cmd.CacheDirs, "", "")}
 
 	for _, src := range cmd.Mounts {
-		srcSt, err := GetSource(src.Spec, name, ApplyFilterMount, sOpts, opts...)
+		srcSt, err := GetSource(src.Spec, name, TargetMountSourceFilter, sOpts, opts...)
 		if err != nil {
 			return llb.Scratch(), err
 		}
@@ -255,35 +248,31 @@ func generateSourceFromImage(name string, st llb.State, cmd *Command, sOpts Sour
 }
 
 func Source2LLBGetter(_ *Spec, src Source, name string, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (llb.State, error) {
-	return GetSource(src, name, ApplyFilter, sOpt, opts...)
+	return GetSource(src, name, DefaultSourceFilter, sOpt, opts...)
 }
 
-type filterOpts struct {
-	srcPath  string
-	includes []string
-	excludes []string
-}
+func filterState(extract string, includes, excludes []string, opts ...llb.ConstraintsOpt) ResultStateOption {
+	return func(st llb.State) (llb.State, error) {
+		// if we have no includes, no excludes, and no non-root source path,
+		// then this is a no-op
+		if len(includes) == 0 && len(excludes) == 0 && extract == "/" {
+			return st, nil
+		}
 
-func filterState(st llb.State, fopts filterOpts, opts ...llb.ConstraintsOpt) llb.State {
-	// if we have no includes, no excludes, and no non-root source path,
-	// then this is a no-op
-	if len(fopts.includes) == 0 && len(fopts.excludes) == 0 && fopts.srcPath == "/" {
-		return st
+		filtered := llb.Scratch().File(
+			llb.Copy(
+				st,
+				extract,
+				"/",
+				WithIncludes(includes),
+				WithExcludes(excludes),
+				WithDirContentsOnly(),
+			),
+			withConstraints(opts),
+		)
+
+		return filtered, nil
 	}
-
-	filtered := llb.Scratch().File(
-		llb.Copy(
-			st,
-			fopts.srcPath,
-			"/",
-			WithIncludes(fopts.includes),
-			WithExcludes(fopts.excludes),
-			WithDirContentsOnly(),
-		),
-		withConstraints(opts),
-	)
-
-	return filtered
 }
 
 func sharingMode(mode string) (llb.CacheMountSharingMode, error) {
